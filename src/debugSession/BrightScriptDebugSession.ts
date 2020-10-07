@@ -25,6 +25,7 @@ import { standardizePath as s } from '../FileUtils';
 import { EvaluateContainer, DebugProtocolAdapter } from '../adapters/DebugProtocolAdapter';
 import { TelnetAdapter } from '../adapters/TelnetAdapter';
 import { BrightScriptDebugCompileError } from '../CompileErrorProcessor';
+import { fileUtils } from '../FileUtils';
 import {
     LaunchStartEvent,
     LogOutputEvent,
@@ -36,6 +37,7 @@ import { LaunchConfiguration, ComponentLibraryConfiguration } from '../LaunchCon
 import { FileManager } from '../managers/FileManager';
 import { SourceMapManager } from '../managers/SourceMapManager';
 import { LocationManager } from '../managers/LocationManager';
+import { BreakpointWriter } from '../managers/BreakpointWriter';
 import { BreakpointManager } from '../managers/BreakpointManager';
 
 export class BrightScriptDebugSession extends BaseDebugSession {
@@ -50,6 +52,7 @@ export class BrightScriptDebugSession extends BaseDebugSession {
         this.fileManager = new FileManager();
         this.sourceMapManager = new SourceMapManager();
         this.locationManager = new LocationManager(this.sourceMapManager);
+        this.breakpointWriter = new BreakpointWriter(this.sourceMapManager, this.locationManager);
         this.breakpointManager = new BreakpointManager(this.sourceMapManager, this.locationManager);
         this.projectManager = new ProjectManager(this.breakpointManager, this.locationManager);
     }
@@ -58,6 +61,7 @@ export class BrightScriptDebugSession extends BaseDebugSession {
 
     public projectManager: ProjectManager;
 
+    public breakpointWriter: BreakpointWriter;
     public breakpointManager: BreakpointManager;
 
     public locationManager: LocationManager;
@@ -79,6 +83,14 @@ export class BrightScriptDebugSession extends BaseDebugSession {
     private evaluateRefIdCounter = 1;
 
     private variables: { [refId: number]: AugmentedVariable } = {};
+    private breakpoints: { [refId: string]: any } = {};
+    private breakpointRefIds: { [refId: string]: number } = {};
+    private breakpointsQueue: {
+        [refId: string]: {
+            response: DebugProtocol.SetBreakpointsResponse,
+            args: DebugProtocol.SetBreakpointsArguments
+        }
+    } = {};
 
     private variableHandles = new Handles<string>();
 
@@ -129,7 +141,12 @@ export class BrightScriptDebugSession extends BaseDebugSession {
         this.enableDebugProtocol = this.launchConfiguration.enableDebugProtocol;
 
         this.projectManager.launchConfiguration = this.launchConfiguration;
-        this.breakpointManager.launchConfiguration = this.launchConfiguration;
+
+        this.breakpointWriter.supportNormalBreakpoints = !this.enableDebugProtocol;
+        this.breakpointWriter.supportConditionalBreakpoints = true;
+        this.breakpointWriter.supportHitConditionalBreakpoints = !this.enableDebugProtocol;
+        this.breakpointWriter.supportLogPoints = true;
+        this.breakpointWriter.launchConfiguration = this.launchConfiguration;
 
         let disconnect = () => {
         };
@@ -143,6 +160,10 @@ export class BrightScriptDebugSession extends BaseDebugSession {
                 this.prepareMainProject(),
                 this.prepareAndHostComponentLibraries(this.launchConfiguration.componentLibraries, this.launchConfiguration.componentLibrariesPort)
             ]);
+
+            this.breakpointManager.on('changed', async (data) => {
+                await this.rokuAdapter.workOnBreakpoints(this.breakpointManager, this.projectManager);
+            });
 
             util.log(`Connecting to Roku via ${this.enableDebugProtocol ? 'the BrightScript debug protocol' : 'telnet'} at ${this.launchConfiguration.host}`);
 
@@ -183,6 +204,11 @@ export class BrightScriptDebugSession extends BaseDebugSession {
             // Send rendezvous events to the extension
             this.rokuAdapter.on('rendezvous-event', (output) => {
                 this.sendEvent(new RendezvousEvent(output));
+            });
+
+            // Send breakpoint change events to the extension
+            this.rokuAdapter.on('breakpoint-change', (output) => {
+                this.sendEvent(output);
             });
 
             //listen for a closed connection (shut down when received)
@@ -249,7 +275,7 @@ export class BrightScriptDebugSession extends BaseDebugSession {
                 await this.connectRokuAdapter();
             }
 
-            //tell the adapter adapter that the channel has been launched.
+            //tell the adapter that the channel has been launched.
             await this.rokuAdapter.activate();
 
             if (!error) {
@@ -328,10 +354,10 @@ export class BrightScriptDebugSession extends BaseDebugSession {
         util.log('Adding stop statements for active breakpoints');
 
         //prevent new breakpoints from being verified
-        this.breakpointManager.lockBreakpoints();
+        this.breakpointWriter.lockBreakpoints();
 
         //write all `stop` statements to the files in the staging folder
-        await this.breakpointManager.writeBreakpointsForProject(this.projectManager.mainProject);
+        await this.breakpointWriter.writeBreakpointsForProject(this.projectManager.mainProject);
 
         //create zip package from staging folder
         util.log('Creating zip archive from project sources');
@@ -386,7 +412,7 @@ export class BrightScriptDebugSession extends BaseDebugSession {
                 util.log('Adding stop statements for active breakpoints in Component Libraries');
 
                 //write the `stop` statements to every file that has breakpoints
-                await this.breakpointManager.writeBreakpointsForProject(compLibProject);
+                await this.breakpointWriter.writeBreakpointsForProject(compLibProject);
 
                 await compLibProject.postfixFiles();
 
@@ -426,17 +452,24 @@ export class BrightScriptDebugSession extends BaseDebugSession {
     /**
      * Called every time a breakpoint is created, modified, or deleted, for each file. This receives the entire list of breakpoints every time.
      */
-    public setBreakPointsRequest(response: DebugProtocol.SetBreakpointsResponse, args: DebugProtocol.SetBreakpointsArguments) {
-        let sanitizedBreakpoints = this.breakpointManager.replaceBreakpoints(args.source.path, args.breakpoints);
-        //sort the breakpoints
-        var sortedAndFilteredBreakpoints = orderBy(sanitizedBreakpoints, [x => x.line, x => x.column])
-            //filter out the inactive breakpoints
-            .filter(x => x.isHidden === false);
+    public async setBreakPointsRequest(response: DebugProtocol.SetBreakpointsResponse, args: DebugProtocol.SetBreakpointsArguments) {
+        let breakpoints = this.breakpointManager.queueBreakpointsForFile(args);
 
         response.body = {
-            breakpoints: sortedAndFilteredBreakpoints
+            breakpoints: breakpoints
         };
         this.sendResponse(response);
+
+        // let sanitizedBreakpoints = this.breakpointManager.replaceBreakpoints(args.source.path, args.breakpoints);
+        // //sort the breakpoints
+        // var sortedAndFilteredBreakpoints = orderBy(sanitizedBreakpoints, [x => x.line, x => x.column])
+        //     //filter out the inactive breakpoints
+        //     .filter(x => x.isHidden === false);
+
+        // response.body = {
+        //     breakpoints: sortedAndFilteredBreakpoints
+        // };
+        // this.sendResponse(response);
 
         //set a small timeout so the user sees the breakpoints disappear before reappearing
         //This is disabled because I'm not sure anyone actually wants this functionality, but I didn't want to lose it.
@@ -452,6 +485,10 @@ export class BrightScriptDebugSession extends BaseDebugSession {
         //         }));
         //     }
         // }, 100);
+    }
+
+    private async sendQueuedBreakpointsToDevice() {
+        await this.rokuAdapter.workOnBreakpoints(this.breakpointManager, this.projectManager);
     }
 
     protected async exceptionInfoRequest(response: DebugProtocol.ExceptionInfoResponse, args: DebugProtocol.ExceptionInfoArguments) {
@@ -803,6 +840,7 @@ export class BrightScriptDebugSession extends BaseDebugSession {
             // Socket debugger will always stop all threads and supports multi thread inspection.
             (event.body as any).allThreadsStopped = this.enableDebugProtocol;
             this.sendEvent(event);
+            await this.sendQueuedBreakpointsToDevice();
         });
 
         //anytime the adapter encounters an exception on the roku,
